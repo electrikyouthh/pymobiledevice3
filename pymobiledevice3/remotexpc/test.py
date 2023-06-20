@@ -1,13 +1,17 @@
-from socket import create_connection
+import asyncio
+from socket import AF_INET6, create_connection, inet_ntop
 from typing import Mapping
 
 import click
-from scapy.contrib.http2 import H2DataFrame, H2Frame, H2Setting, H2SettingsFrame, H2WindowUpdateFrame
-
+from ifaddr import get_adapters
 from pymobiledevice3.lockdown import create_using_remotexpc
+from scapy.contrib.http2 import (H2DataFrame, H2Frame, H2Setting,
+                                 H2SettingsFrame, H2WindowUpdateFrame)
+from zeroconf import ServiceBrowser, ServiceListener, Zeroconf
+from zeroconf.const import _TYPE_AAAA
+
 from sniffer import HTTP2_MAGIC
-from structs import XpcWrapper, create_xpc_wrapper, \
-    get_object_from_xpc_wrapper
+from structs import XpcWrapper, create_xpc_wrapper, get_object_from_xpc_wrapper
 
 # from remoted ([RSDRemoteNCMDeviceDevice createPortListener])
 RSD_PORT = 58783
@@ -83,13 +87,47 @@ class RemoteXPC:
         return H2Frame(buf)
 
 
+class RemotedListener(ServiceListener):
+    def __init__(self):
+        super().__init__()
+        self.is_finished = asyncio.Event()
+
+    def add_service(self, zc: Zeroconf, type_: str, name: str) -> None:
+        if name == 'ncm._remoted._tcp.local.':
+            records = zc.cache.async_entries_with_name('iphone.local.')
+            for record in records:
+                if record.type == _TYPE_AAAA:
+                    self.record = record
+                    self.is_finished.set()
+
+
+async def try_get_iphone_address(adapter):
+    ip = adapter.ips[0].ip[0]
+    zeroconf = Zeroconf(interfaces=[ip])
+    waiter_task = asyncio.create_task(zeroconf.notify_event.wait())
+    listener = RemotedListener()
+    ServiceBrowser(zeroconf, "_remoted._tcp.local.", listener)
+    await waiter_task
+    await listener.is_finished.wait()
+    return inet_ntop(AF_INET6, listener.record.address) + '%' + adapter.nice_name
+
+
+async def get_iphone_address():
+    adapters = get_adapters()
+    adapters = [adapter for adapter in adapters if adapter.ips[0].is_IPv6]
+    tasks = [asyncio.create_task(try_get_iphone_address(adapter)) for adapter in adapters]
+    finished, unfinished = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    return list(finished)[0].result()
+
+
 @click.command()
 def cli():
-    remote = RemoteXPC('fe80::fc1b:abff:febe:948f%en19')
+    addr = asyncio.run(get_iphone_address())
+    remote = RemoteXPC(addr)
     remote.connect()
     handshake = remote.do_handshake()
     lockdown_port = int(handshake['Services']['com.apple.mobile.lockdown.remote.untrusted']['Port'])
-    lockdown = create_using_remotexpc(hostname='fe80::fc1b:abff:febe:948f%en19', autopair=False,
+    lockdown = create_using_remotexpc(hostname=addr, autopair=False,
                                       port=lockdown_port)
     print(lockdown)
 
