@@ -1,7 +1,10 @@
+import ctypes
+import uuid
 from typing import Mapping
 
-from construct import Aligned, Array, Byte, Bytes, Const, CString, Default, Double, Enum, FixedSized, FlagsEnum, Hex, \
-    If, Int32ul, Int64sl, Int64ul, LazyBound, Prefixed, Struct, Switch, setGlobalPrintFullStrings, this
+from construct import Aligned, Array, Bytes, Const, CString, Default, Double, Enum, FixedSized, FlagsEnum, Hex, \
+    If, Int32ul, Int64sl, Int64ul, LazyBound, Prefixed, Struct, Switch, setGlobalPrintFullStrings, this, Probe, \
+    GreedyBytes
 
 XpcMessageType = Enum(Hex(Int32ul),
                       NULL=0x00001000,
@@ -51,7 +54,7 @@ XpcUInt64 = Int64ul
 XpcDouble = Double
 XpcPointer = None
 XpcDate = Int64ul
-XpcData = Prefixed(Int32ul, Byte)
+XpcData = Aligned(4, Prefixed(Int32ul, GreedyBytes))
 XpcString = Aligned(4, Prefixed(Int32ul, CString('utf8')))
 XpcUuid = Bytes(16)
 XpcFd = Int32ul
@@ -63,11 +66,10 @@ XpcDictionaryEntry = Struct(
     'value' / LazyBound(lambda: XpcObject),
 )
 
-XpcDictionary = Struct(
-    'size' / Hex(Int32ul),
+XpcDictionary = Prefixed(Int32ul, Struct(
     'count' / Hex(Int32ul),
-    'entries' / If(this.count > 0, FixedSized(this.size - 4, Array(this.count, XpcDictionaryEntry))),
-)
+    'entries' / If(this.count > 0, Array(this.count, XpcDictionaryEntry)),
+))
 
 XpcObject = Struct(
     'type' / XpcMessageType,
@@ -86,7 +88,7 @@ XpcObject = Struct(
         XpcMessageType.FD: XpcFd,
         XpcMessageType.SHMEM: XpcShmem,
         XpcMessageType.ARRAY: XpcArray,
-    }),  # default=Probe(lookahead=20)),
+    }, default=Probe(lookahead=20)),
 )
 
 XpcPayload = Struct(
@@ -121,7 +123,31 @@ def _get_dict_from_xpc_object(xpc_object):
             result.append(_get_dict_from_xpc_object(entry.value))
         return result
 
-    return xpc_object.data
+    elif type_ == XpcMessageType.BOOL:
+        return bool(xpc_object.data)
+
+    elif type_ == XpcMessageType.INT64:
+        return XpcInt64Type(xpc_object.data)
+
+    elif type_ == XpcMessageType.UINT64:
+        return XpcUInt64Type(xpc_object.data)
+
+    elif type_ == XpcMessageType.UUID:
+        return uuid.UUID(bytes=xpc_object.data)
+
+    elif type_ in (XpcMessageType.STRING, XpcMessageType.DATA):
+        return xpc_object.data
+
+    else:
+        raise Exception(f'deserialize error: {xpc_object}')
+
+
+class XpcInt64Type(int):
+    pass
+
+
+class XpcUInt64Type(int):
+    pass
 
 
 def get_object_from_xpc_wrapper(payload: bytes):
@@ -131,20 +157,67 @@ def get_object_from_xpc_wrapper(payload: bytes):
     return _get_dict_from_xpc_object(payload.message)
 
 
-def create_xpc_wrapper(d: Mapping) -> bytes:
-    xpc_object = {
-        'type': XpcMessageType.DICTIONARY,
-        'data': {
-            'size': 4,
-            'count': 0,
-            'entries': [],
+def build_xpc_object(payload) -> Mapping:
+    if isinstance(payload, list):
+        entries = []
+        for entry in payload:
+            entry = build_xpc_object(entry)
+            entries.append(entry)
+        xpc_object = {
+            'type': XpcMessageType.ARRAY,
+            'data': entries
         }
-    }
+    elif isinstance(payload, dict):
+        entries = []
+        for key, value in payload.items():
+            entry = {'key': key, 'value': build_xpc_object(value)}
+            entries.append(entry)
+        xpc_object = {
+            'type': XpcMessageType.DICTIONARY,
+            'data': {
+                'count': len(entries),
+                'entries': entries,
+            }
+        }
+    elif isinstance(payload, bool):
+        xpc_object = {
+            'type': XpcMessageType.BOOL,
+            'data': payload,
+        }
+    elif isinstance(payload, str):
+        xpc_object = {
+            'type': XpcMessageType.STRING,
+            'data': payload,
+        }
+    elif isinstance(payload, XpcUInt64Type):
+        xpc_object = {
+            'type': XpcMessageType.UINT64,
+            'data': payload,
+        }
+    elif isinstance(payload, XpcInt64Type):
+        xpc_object = {
+            'type': XpcMessageType.INT64,
+            'data': payload,
+        }
+    else:
+        raise Exception(f'unrecognized type for: {payload}')
+
+    return xpc_object
+
+
+def create_xpc_wrapper(d: Mapping, message_id: int = 0) -> bytes:
+    flags = XpcFlags.ALWAYS_SET
+    if len(d.keys()) > 0:
+        flags |= XpcFlags.DATA_PRESENT
+
     xpc_payload = {
-        'message': xpc_object
+        'message': build_xpc_object(d)
     }
+
     xpc_wrapper = {
+        'flags': flags,
         'size': len(XpcPayload.build(xpc_payload)),
+        'message_id': message_id,
         'payload': xpc_payload,
     }
     return XpcWrapper.build(xpc_wrapper)

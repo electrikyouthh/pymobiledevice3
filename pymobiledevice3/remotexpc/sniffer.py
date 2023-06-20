@@ -175,7 +175,7 @@ class RemoteXPCSniffer:
 
         try:
             xpc_wrapper = XpcWrapper.parse(frame.data)
-            logger.info(f'XpcWrapper: {xpc_wrapper}')
+            # logger.info(f'XpcWrapper: {xpc_wrapper}')
             xpc_message = get_object_from_xpc_wrapper(frame.data)
 
             if xpc_message is not None:

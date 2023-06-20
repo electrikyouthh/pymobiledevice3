@@ -1,17 +1,21 @@
 import asyncio
-from socket import AF_INET6, create_connection, inet_ntop
-from typing import Mapping
+import plistlib
+from pprint import pprint
+from socket import AF_INET6, inet_ntop
+from socket import create_connection
+from typing import Mapping, Tuple
 
 import click
 from ifaddr import get_adapters
-from pymobiledevice3.lockdown import create_using_remotexpc
 from scapy.contrib.http2 import (H2DataFrame, H2Frame, H2Setting,
                                  H2SettingsFrame, H2WindowUpdateFrame)
 from zeroconf import ServiceBrowser, ServiceListener, Zeroconf
 from zeroconf.const import _TYPE_AAAA
 
+from pymobiledevice3.lockdown import create_using_remotexpc
 from sniffer import HTTP2_MAGIC
-from structs import XpcWrapper, create_xpc_wrapper, get_object_from_xpc_wrapper
+from structs import XpcWrapper, create_xpc_wrapper, \
+    get_object_from_xpc_wrapper, XpcInt64Type, XpcUInt64Type
 
 # from remoted ([RSDRemoteNCMDeviceDevice createPortListener])
 RSD_PORT = 58783
@@ -20,12 +24,12 @@ H2FRAME_SIZE = len(H2Frame())
 
 
 class RemoteXPC:
-    def __init__(self, address: str):
+    def __init__(self, address: Tuple[str, int]):
         self.address = address
         self.sock = None
 
     def connect(self) -> None:
-        self.sock = create_connection((self.address, RSD_PORT))
+        self.sock = create_connection(self.address)
         print(self.sock)
 
     def do_handshake(self) -> Mapping:
@@ -45,9 +49,10 @@ class RemoteXPC:
         # send empty headers packet (stream_id=1)
         self.sock.sendall(b'\x00\x00\x00\x01\x04\x00\x00\x00\x01')
 
-        xpc_wrapper = create_xpc_wrapper({})
-        packet = H2Frame(type=0, stream_id=1) / H2DataFrame(data=xpc_wrapper)
-        self.sock.sendall(bytes(packet))
+        # xpc_wrapper = create_xpc_wrapper({})
+        # packet = H2Frame(type=0, stream_id=1) / H2DataFrame(data=xpc_wrapper)
+        # self.sock.sendall(bytes(packet))
+        self.send_request({})
 
         packet = H2Frame(type=0, stream_id=1) / H2DataFrame(
             data=XpcWrapper.build({'size': 0, 'flags': 0x0201, 'payload': None}))
@@ -64,15 +69,27 @@ class RemoteXPC:
 
         packet = H2Frame(flags={'A'}) / H2SettingsFrame()
         self.sock.sendall(bytes(packet))
+        return self.receive_response()
 
+    def send_request(self, data: Mapping, message_id: int = 0) -> None:
+        packet = H2Frame(type=0, stream_id=1) / H2DataFrame(data=create_xpc_wrapper(data, message_id=message_id))
+        self.sock.sendall(bytes(packet))
+
+    def receive_response(self):
         while True:
-            # wait for handshake packet
             frame = self.recv_h2_frame()
             if not isinstance(frame.lastlayer(), H2DataFrame):
                 continue
-            if not XpcWrapper.parse(frame.data).flags.DATA_PRESENT:
+            xpc_wrapper = XpcWrapper.parse(frame.data)
+            if xpc_wrapper.payload is None:
+                continue
+            if xpc_wrapper.payload.message.data.entries is None:
                 continue
             return get_object_from_xpc_wrapper(frame.data)
+
+    def send_recv_request(self, data: Mapping):
+        self.send_request(data, message_id=1)
+        return self.receive_response()
 
     def recv_h2_frame(self) -> H2Frame:
         buf = self.sock.recv(H2FRAME_SIZE)
@@ -122,14 +139,34 @@ async def get_iphone_address():
 
 @click.command()
 def cli():
-    addr = asyncio.run(get_iphone_address())
-    remote = RemoteXPC(addr)
+    hostname = asyncio.run(get_iphone_address())
+    remote = RemoteXPC((hostname, RSD_PORT))
     remote.connect()
     handshake = remote.do_handshake()
+
     lockdown_port = int(handshake['Services']['com.apple.mobile.lockdown.remote.untrusted']['Port'])
-    lockdown = create_using_remotexpc(hostname=addr, autopair=False,
+    lockdown = create_using_remotexpc(hostname=hostname, autopair=False,
                                       port=lockdown_port)
     print(lockdown)
+
+    tunnel_port = int(handshake['Services']['com.apple.internal.dt.coredevice.untrusted.tunnelservice']['Port'])
+    remote = RemoteXPC((hostname, tunnel_port))
+    remote.connect()
+    handshake = remote.do_handshake()
+    print(handshake)
+    response = remote.send_recv_request({
+        'mangledTypeName': 'RemotePairing.ControlChannelMessageEnvelope',
+        'value': {
+            'message': {
+                'plain': {
+                    '_0': {
+                        'request': {
+                            '_0': {'handshake': {'_0': {'hostOptions': {'attemptPairVerify': True},
+                                                        'wireProtocolVersion': XpcInt64Type(19)}}}}}}},
+            'originatedBy': 'host',
+            'sequenceNumber': XpcUInt64Type(0)}})
+    pprint(response)
+    pprint(plistlib.loads(response['value']['message']['plain']['_0']['response']['_1']['handshake']['_0']['peerDeviceInfo']['deviceKVSData']))
 
 
 if __name__ == '__main__':
